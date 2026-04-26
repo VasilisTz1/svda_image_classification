@@ -1,0 +1,1173 @@
+import os
+import time
+import copy
+import json
+import random
+
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import DataLoader
+from torchvision import transforms
+import timm
+from ptflops import get_model_complexity_info
+from datasets import load_dataset
+from PIL import Image
+
+
+# ===== CONFIGURABLE PARAMETERS =====
+params = {
+    "dataset": "ImageNet100",
+    "image_size": 224,
+    "patch_size": 16,
+    "embed_dim": 192,
+    "num_heads": 3,
+    "num_layers": 12,
+    "num_classes": 100,
+    "batch_size": 8,
+    "epochs": 20,
+    "lr": 2e-5,
+    "weight_decay": 1e-4,
+    "lambda_ortho": 5e-6,
+    "entropy_reg_weight": 5e-5,
+    "use_svda": True,
+    "use_pretrained": True,
+    "pretrained_backbone": "vit_tiny_patch16_224",
+    "replace_last_n_blocks": 2,
+    "seed": 42,
+    "seeds": [42, 43, 44],
+    "log_root": "runs_imagenet100_pretrained",
+    "compute_interpretability": True,
+    "compute_efficiency": True,
+    "faithfulness_eval_samples": 64,
+    "faithfulness_topk_fracs": [0.1, 0.2, 0.3],
+    "attention_layer_aggregation": "last",
+    "attention_head_aggregation": "mean",
+    "profile_batch_sizes": [1, 8],
+    "run_training": True,
+    "run_reporting": True,
+    "in_channels": 3,
+    "num_workers": 4,
+    "svda_sigma_noise_std": 0.005,
+    "freeze_patch_embed": False,
+    "freeze_positional_tokens": False,
+    "freeze_first_n_blocks": 0,
+    "train_head_only_warmup_epochs": 0,
+}
+
+
+IMAGENET_MEAN = (0.485, 0.456, 0.406)
+IMAGENET_STD = (0.229, 0.224, 0.225)
+_HF_DATASET_CACHE = None
+
+
+def set_seed(seed=42):
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    np.random.seed(seed)
+    random.seed(seed)
+    if hasattr(torch.backends, "cudnn"):
+        torch.backends.cudnn.deterministic = True
+        torch.backends.cudnn.benchmark = False
+
+
+def get_device():
+    if torch.backends.mps.is_available():
+        return torch.device("mps")
+    if torch.cuda.is_available():
+        return torch.device("cuda")
+    return torch.device("cpu")
+
+
+set_seed(params["seed"])
+device = get_device()
+print("Using device:", device)
+
+
+train_transform = transforms.Compose([
+    transforms.RandomResizedCrop(params["image_size"]),
+    transforms.RandomHorizontalFlip(),
+    transforms.ToTensor(),
+    transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+])
+
+test_transform = transforms.Compose([
+    transforms.Resize(256),
+    transforms.CenterCrop(params["image_size"]),
+    transforms.ToTensor(),
+    transforms.Normalize(IMAGENET_MEAN, IMAGENET_STD),
+])
+
+
+class HFDatasetWrapper(torch.utils.data.Dataset):
+    def __init__(self, hf_split, transform=None):
+        self.hf_split = hf_split
+        self.transform = transform
+
+    def __len__(self):
+        return len(self.hf_split)
+
+    def __getitem__(self, idx):
+        item = self.hf_split[idx]
+        image = item["image"]
+        label = item["label"]
+
+        if not isinstance(image, Image.Image):
+            image = Image.fromarray(image)
+        image = image.convert("RGB")
+
+        if self.transform is not None:
+            image = self.transform(image)
+        return image, label
+
+
+def get_hf_dataset():
+    global _HF_DATASET_CACHE
+    if _HF_DATASET_CACHE is None:
+        _HF_DATASET_CACHE = load_dataset("clane9/imagenet-100")
+    return _HF_DATASET_CACHE
+
+
+def build_dataloaders(current_params):
+    hf_ds = get_hf_dataset()
+    train_split_name = "train"
+    test_split_name = "validation" if "validation" in hf_ds else "test"
+
+    train_data = HFDatasetWrapper(hf_ds[train_split_name], transform=train_transform)
+    test_data = HFDatasetWrapper(hf_ds[test_split_name], transform=test_transform)
+
+    train_loader = DataLoader(
+        train_data,
+        batch_size=current_params["batch_size"],
+        shuffle=True,
+        num_workers=current_params["num_workers"],
+        pin_memory=torch.cuda.is_available(),
+    )
+    test_loader = DataLoader(
+        test_data,
+        batch_size=current_params["batch_size"],
+        shuffle=False,
+        num_workers=current_params["num_workers"],
+        pin_memory=torch.cuda.is_available(),
+    )
+    return train_loader, test_loader
+
+
+def get_run_name(model_name, seed):
+    return f"imagenet100_pretrained_{model_name}_seed{seed}"
+
+
+def get_run_dirs(current_params, model_name, seed):
+    run_name = get_run_name(model_name, seed)
+    run_root = os.path.join(current_params["log_root"], run_name)
+    dirs = {
+        "root": run_root,
+        "checkpoints": os.path.join(run_root, "checkpoints"),
+        "metrics": os.path.join(run_root, "metrics"),
+        "figures": os.path.join(run_root, "figures"),
+        "profiles": os.path.join(run_root, "profiles"),
+    }
+    for path in dirs.values():
+        os.makedirs(path, exist_ok=True)
+    return dirs
+
+
+def measure_model_complexity(model, input_res=None):
+    if input_res is None:
+        input_res = (params["in_channels"], params["image_size"], params["image_size"])
+    model = model.cpu()
+    model.eval()
+    with torch.no_grad():
+        macs, n_params = get_model_complexity_info(
+            model,
+            input_res,
+            as_strings=False,
+            print_per_layer_stat=False,
+            verbose=False,
+        )
+    return macs, n_params
+
+
+def sigma_entropy_loss(sigmas):
+    p = sigmas ** 2
+    p = p / (p.sum(dim=-1, keepdim=True) + 1e-8)
+    entropy = -(p * torch.log(p + 1e-8)).sum(dim=-1)
+    return entropy.mean()
+
+
+def spectral_entropy(sigmas):
+    p = sigmas ** 2
+    p = p / (p.sum(dim=-1, keepdim=True) + 1e-8)
+    entropy = -(p * torch.log(p + 1e-8)).sum(dim=-1)
+    return entropy
+
+
+def effective_rank(entropy_tensor):
+    return torch.exp(entropy_tensor).mean().item()
+
+
+def spectral_sparsity(sigmas, threshold=1e-3):
+    mask = (sigmas.abs() < threshold).float()
+    return mask.mean().item()
+
+
+class BaselineAttentionFromPretrained(nn.Module):
+    def __init__(self, dim, num_heads, dropout=0.0):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.dropout = dropout
+
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.out_proj = nn.Linear(dim, dim)
+        self.attn_weights = None
+
+    @classmethod
+    def from_torchvision_mha(cls, mha):
+        module = cls(mha.embed_dim, mha.num_heads, dropout=mha.dropout)
+        with torch.no_grad():
+            q_w, k_w, v_w = mha.in_proj_weight.chunk(3, dim=0)
+            q_b, k_b, v_b = mha.in_proj_bias.chunk(3, dim=0)
+            module.q_proj.weight.copy_(q_w)
+            module.k_proj.weight.copy_(k_w)
+            module.v_proj.weight.copy_(v_w)
+            module.q_proj.bias.copy_(q_b)
+            module.k_proj.bias.copy_(k_b)
+            module.v_proj.bias.copy_(v_b)
+            module.out_proj.weight.copy_(mha.out_proj.weight)
+            module.out_proj.bias.copy_(mha.out_proj.bias)
+        return module
+
+    @classmethod
+    def from_timm_attn(cls, attn):
+        module = cls(attn.qkv.in_features, attn.num_heads, dropout=attn.attn_drop.p)
+        with torch.no_grad():
+            q_w, k_w, v_w = attn.qkv.weight.chunk(3, dim=0)
+            if attn.qkv.bias is not None:
+                q_b, k_b, v_b = attn.qkv.bias.chunk(3, dim=0)
+            else:
+                q_b = torch.zeros_like(module.q_proj.bias)
+                k_b = torch.zeros_like(module.k_proj.bias)
+                v_b = torch.zeros_like(module.v_proj.bias)
+            module.q_proj.weight.copy_(q_w)
+            module.k_proj.weight.copy_(k_w)
+            module.v_proj.weight.copy_(v_w)
+            module.q_proj.bias.copy_(q_b)
+            module.k_proj.bias.copy_(k_b)
+            module.v_proj.bias.copy_(v_b)
+            module.out_proj.weight.copy_(attn.proj.weight)
+            module.out_proj.bias.copy_(attn.proj.bias)
+        return module
+
+    def forward(self, x):
+        B, N, _ = x.shape
+        q = self.q_proj(x).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = self.k_proj(x).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = self.v_proj(x).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        scores = torch.matmul(q, k.transpose(-1, -2)) * self.scale
+        attn = F.softmax(scores, dim=-1)
+        if self.training and self.dropout > 0.0:
+            attn = F.dropout(attn, p=self.dropout)
+        self.attn_weights = attn.detach()
+
+        out = torch.matmul(attn, v)
+        out = out.permute(0, 2, 1, 3).reshape(B, N, self.dim)
+        out = self.out_proj(out)
+        return out
+
+
+class SVDAAttentionFromPretrained(nn.Module):
+    def __init__(self, dim, num_heads, dropout=0.0, lambda_ortho=0.0):
+        super().__init__()
+        self.dim = dim
+        self.num_heads = num_heads
+        self.head_dim = dim // num_heads
+        self.scale = self.head_dim ** -0.5
+        self.dropout = dropout
+        self.lambda_ortho = lambda_ortho
+
+        self.q_proj = nn.Linear(dim, dim)
+        self.k_proj = nn.Linear(dim, dim)
+        self.v_proj = nn.Linear(dim, dim)
+        self.out_proj = nn.Linear(dim, dim)
+
+        self.sigmas = nn.Parameter(torch.ones(num_heads, self.head_dim))
+        self.attn_weights = None
+        self.angular_alignments = None
+
+    @classmethod
+    def from_torchvision_mha(cls, mha, lambda_ortho=0.0):
+        module = cls(mha.embed_dim, mha.num_heads, dropout=mha.dropout, lambda_ortho=lambda_ortho)
+        with torch.no_grad():
+            q_w, k_w, v_w = mha.in_proj_weight.chunk(3, dim=0)
+            q_b, k_b, v_b = mha.in_proj_bias.chunk(3, dim=0)
+            module.q_proj.weight.copy_(q_w)
+            module.k_proj.weight.copy_(k_w)
+            module.v_proj.weight.copy_(v_w)
+            module.q_proj.bias.copy_(q_b)
+            module.k_proj.bias.copy_(k_b)
+            module.v_proj.bias.copy_(v_b)
+            module.out_proj.weight.copy_(mha.out_proj.weight)
+            module.out_proj.bias.copy_(mha.out_proj.bias)
+            sigma_init = torch.ones_like(module.sigmas)
+            if params["svda_sigma_noise_std"] > 0:
+                sigma_init = sigma_init + params["svda_sigma_noise_std"] * torch.randn_like(sigma_init)
+            module.sigmas.copy_(sigma_init)
+        return module
+
+    @classmethod
+    def from_timm_attn(cls, attn, lambda_ortho=0.0):
+        module = cls(attn.qkv.in_features, attn.num_heads, dropout=attn.attn_drop.p, lambda_ortho=lambda_ortho)
+        with torch.no_grad():
+            q_w, k_w, v_w = attn.qkv.weight.chunk(3, dim=0)
+            if attn.qkv.bias is not None:
+                q_b, k_b, v_b = attn.qkv.bias.chunk(3, dim=0)
+            else:
+                q_b = torch.zeros_like(module.q_proj.bias)
+                k_b = torch.zeros_like(module.k_proj.bias)
+                v_b = torch.zeros_like(module.v_proj.bias)
+            module.q_proj.weight.copy_(q_w)
+            module.k_proj.weight.copy_(k_w)
+            module.v_proj.weight.copy_(v_w)
+            module.q_proj.bias.copy_(q_b)
+            module.k_proj.bias.copy_(k_b)
+            module.v_proj.bias.copy_(v_b)
+            module.out_proj.weight.copy_(attn.proj.weight)
+            module.out_proj.bias.copy_(attn.proj.bias)
+            sigma_init = torch.ones_like(module.sigmas)
+            if params["svda_sigma_noise_std"] > 0:
+                sigma_init = sigma_init + params["svda_sigma_noise_std"] * torch.randn_like(sigma_init)
+            module.sigmas.copy_(sigma_init)
+        return module
+
+    def forward(self, x):
+        B, N, _ = x.shape
+        q = self.q_proj(x).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        k = self.k_proj(x).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+        v = self.v_proj(x).reshape(B, N, self.num_heads, self.head_dim).permute(0, 2, 1, 3)
+
+        q = F.normalize(q, dim=-1)
+        k = F.normalize(k, dim=-1)
+        cos_sim = torch.sum(q * k, dim=-1).mean(dim=-1).mean(dim=0)
+        self.angular_alignments = cos_sim.detach()
+
+        weighted_q = q * self.sigmas.unsqueeze(0).unsqueeze(2)
+        scores = torch.matmul(weighted_q, k.transpose(-1, -2)) * self.scale
+        attn = F.softmax(scores, dim=-1)
+        if self.training and self.dropout > 0.0:
+            attn = F.dropout(attn, p=self.dropout)
+        self.attn_weights = attn.detach()
+
+        out = torch.matmul(attn, v)
+        out = out.permute(0, 2, 1, 3).reshape(B, N, self.dim)
+        out = self.out_proj(out)
+        return out
+
+    def orthogonality_loss(self):
+        q_gram = self.q_proj.weight.T @ self.q_proj.weight
+        k_gram = self.k_proj.weight.T @ self.k_proj.weight
+        eye_q = torch.eye(q_gram.size(0), device=self.q_proj.weight.device)
+        eye_k = torch.eye(k_gram.size(0), device=self.k_proj.weight.device)
+        loss_q = ((q_gram - eye_q) ** 2).mean()
+        loss_k = ((k_gram - eye_k) ** 2).mean()
+        return self.lambda_ortho * (loss_q + loss_k)
+
+
+class PretrainedTransformerBlock(nn.Module):
+    def __init__(self, src_block, use_svda=False, lambda_ortho=0.0):
+        super().__init__()
+        self.norm1 = copy.deepcopy(src_block.norm1)
+        self.norm2 = copy.deepcopy(src_block.norm2)
+        self.mlp = copy.deepcopy(src_block.mlp)
+        self.drop_path1 = copy.deepcopy(src_block.drop_path1) if hasattr(src_block, "drop_path1") else nn.Identity()
+        self.drop_path2 = copy.deepcopy(src_block.drop_path2) if hasattr(src_block, "drop_path2") else nn.Identity()
+        if use_svda:
+            self.attn = SVDAAttentionFromPretrained.from_timm_attn(
+                src_block.attn,
+                lambda_ortho=lambda_ortho,
+            )
+        else:
+            self.attn = BaselineAttentionFromPretrained.from_timm_attn(src_block.attn)
+
+    def forward(self, x):
+        x = x + self.drop_path1(self.attn(self.norm1(x)))
+        x = x + self.drop_path2(self.mlp(self.norm2(x)))
+        return x
+
+    def get_ortho_loss(self):
+        if hasattr(self.attn, "orthogonality_loss"):
+            return self.attn.orthogonality_loss()
+        return 0.0
+
+
+class PretrainedVisionTransformer(nn.Module):
+    def __init__(self, use_svda=False, num_classes=100, lambda_ortho=0.0):
+        super().__init__()
+        base = timm.create_model(params["pretrained_backbone"], pretrained=True)
+
+        self.image_size = params["image_size"]
+        self.patch_size = params["patch_size"]
+        self.embed_dim = params["embed_dim"]
+        self.num_heads = params["num_heads"]
+        self.num_layers = params["num_layers"]
+        self.use_svda = use_svda
+
+        self.patch_embed = copy.deepcopy(base.patch_embed)
+        self.class_token = nn.Parameter(base.cls_token.detach().clone())
+        self.pos_embedding = nn.Parameter(base.pos_embed.detach().clone())
+        self.encoder_dropout = copy.deepcopy(base.pos_drop)
+        replace_last_n = params["replace_last_n_blocks"]
+        total_blocks = len(base.blocks)
+        self.blocks = nn.ModuleList()
+        for idx, layer in enumerate(base.blocks):
+            if idx < total_blocks - replace_last_n:
+                self.blocks.append(copy.deepcopy(layer))
+            else:
+                self.blocks.append(
+                    PretrainedTransformerBlock(layer, use_svda=use_svda, lambda_ortho=lambda_ortho)
+                )
+        self.encoder_ln = copy.deepcopy(base.norm)
+        self.head = nn.Linear(self.embed_dim, num_classes)
+
+        nn.init.xavier_uniform_(self.head.weight)
+        nn.init.zeros_(self.head.bias)
+
+    def _process_input(self, x):
+        x = self.patch_embed(x)
+        return x
+
+    def forward_features(self, x):
+        n = x.shape[0]
+        x = self._process_input(x)
+        cls = self.class_token.expand(n, -1, -1)
+        x = torch.cat([cls, x], dim=1)
+        x = x + self.pos_embedding
+        x = self.encoder_dropout(x)
+        for block in self.blocks:
+            x = block(x)
+        x = self.encoder_ln(x)
+        return x[:, 0]
+
+    def forward(self, x):
+        feats = self.forward_features(x)
+        return self.head(feats)
+
+    def orthogonality_loss(self):
+        losses = []
+        for block in self.blocks:
+            if hasattr(block, "get_ortho_loss"):
+                losses.append(block.get_ortho_loss())
+        if len(losses) == 0:
+            return 0.0
+        return sum(losses)
+
+
+# Helper functions for freezing/unfreezing layers and optimizer construction
+
+def set_trainable_layers(model, use_svda, current_epoch, current_params):
+    for p in model.parameters():
+        p.requires_grad = True
+
+    if current_params["freeze_patch_embed"]:
+        for p in model.patch_embed.parameters():
+            p.requires_grad = False
+
+    if current_params["freeze_positional_tokens"]:
+        model.class_token.requires_grad = False
+        model.pos_embedding.requires_grad = False
+
+    replace_last_n = current_params["replace_last_n_blocks"]
+    if replace_last_n > 0:
+        frozen_prefix = len(model.blocks) - replace_last_n
+        for block in model.blocks[:frozen_prefix]:
+            for p in block.parameters():
+                p.requires_grad = False
+
+    if not use_svda:
+        return
+
+    warmup_epochs = current_params["train_head_only_warmup_epochs"]
+    if warmup_epochs > 0 and current_epoch < warmup_epochs:
+        for p in model.parameters():
+            p.requires_grad = False
+        for p in model.head.parameters():
+            p.requires_grad = True
+        for block in model.blocks:
+            if hasattr(block, "attn") and hasattr(block.attn, "sigmas"):
+                block.attn.sigmas.requires_grad = True
+
+
+def build_optimizer(model, current_params):
+    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    return torch.optim.AdamW(
+        trainable_params,
+        lr=current_params["lr"],
+        weight_decay=current_params["weight_decay"],
+    )
+
+
+def summarize_attention_metrics(model, current_params, eval_loader, current_device, epsilon=1e-2):
+    model.eval()
+    summary = {
+        "entropy": np.nan,
+        "effective_rank": np.nan,
+        "sparsity": np.nan,
+        "selectivity": np.nan,
+        "robustness": np.nan,
+        "angular_alignment": np.nan,
+    }
+    if not current_params["use_svda"]:
+        return summary
+
+    with torch.no_grad():
+        sigma_blocks = [block.attn.sigmas.detach().cpu() for block in model.blocks if hasattr(block, "attn") and hasattr(block.attn, "sigmas")]
+        if len(sigma_blocks) == 0:
+            return summary
+        all_sigmas = torch.stack(sigma_blocks)
+        ent = spectral_entropy(all_sigmas)
+        summary["entropy"] = ent.mean().item()
+        summary["effective_rank"] = torch.exp(ent).mean().item()
+        summary["sparsity"] = spectral_sparsity(all_sigmas)
+
+        selectivity_vals = []
+        for block in model.blocks:
+            if hasattr(block, "attn") and hasattr(block.attn, "attn_weights") and block.attn.attn_weights is not None:
+                A = block.attn.attn_weights
+                sel = 1 - (A ** 2).sum(dim=-1) / (A.sum(dim=-1) ** 2 + 1e-8)
+                selectivity_vals.append(sel.mean().item())
+        if selectivity_vals:
+            summary["selectivity"] = float(np.mean(selectivity_vals))
+
+        sample_x, _ = next(iter(eval_loader))
+        sample_x = sample_x[:1].to(current_device)
+        delta = torch.randn_like(sample_x) * epsilon
+        perturbed_x = torch.clamp(sample_x + delta, -5, 5)
+        _ = model(sample_x)
+        A_clean_all = [block.attn.attn_weights for block in model.blocks if hasattr(block, "attn") and hasattr(block.attn, "attn_weights") and block.attn.attn_weights is not None]
+        _ = model(perturbed_x)
+        A_perturbed_all = [block.attn.attn_weights for block in model.blocks if hasattr(block, "attn") and hasattr(block.attn, "attn_weights") and block.attn.attn_weights is not None]
+        robustness_vals = []
+        for A_clean, A_perturbed in zip(A_clean_all, A_perturbed_all):
+            delta_A = (A_clean - A_perturbed).norm(p="fro") / A_clean.numel()
+            robustness_vals.append(delta_A.item())
+        if robustness_vals:
+            summary["robustness"] = float(np.mean(robustness_vals))
+
+        alignments = []
+        for block in model.blocks:
+            if hasattr(block, "attn") and hasattr(block.attn, "angular_alignments") and block.attn.angular_alignments is not None:
+                alignments.append(block.attn.angular_alignments.mean().item())
+        if alignments:
+            summary["angular_alignment"] = float(np.mean(alignments))
+
+    return summary
+
+
+def aggregate_attention_maps(model, x, layer_aggregation="last", head_aggregation="mean"):
+    model.eval()
+    with torch.no_grad():
+        _ = model(x)
+
+    maps = []
+    for block in model.blocks:
+        if hasattr(block, "attn") and hasattr(block.attn, "attn_weights") and block.attn.attn_weights is not None:
+            maps.append(block.attn.attn_weights.detach())
+
+    if not maps:
+        return None
+
+    if layer_aggregation == "last":
+        A = maps[-1]
+    elif layer_aggregation == "mean":
+        A = torch.stack(maps, dim=0).mean(dim=0)
+    else:
+        raise ValueError(f"Unsupported layer_aggregation: {layer_aggregation}")
+
+    if head_aggregation == "mean":
+        A = A.mean(dim=1)
+    elif head_aggregation == "max":
+        A = A.max(dim=1).values
+    elif head_aggregation == "none":
+        return A
+    else:
+        raise ValueError(f"Unsupported head_aggregation: {head_aggregation}")
+
+    return A
+
+
+def extract_cls_attention_scores(model, x, layer_aggregation="last", head_aggregation="mean"):
+    A = aggregate_attention_maps(model, x, layer_aggregation=layer_aggregation, head_aggregation=head_aggregation)
+    if A is None:
+        return None
+    if A.dim() == 4:
+        A = A.mean(dim=1)
+    cls_to_patches = A[:, 0, 1:]
+    return cls_to_patches
+
+
+def build_patch_mask(attention_scores, patch_size, image_shape, topk_frac, mode="top"):
+    B, num_patches = attention_scores.shape
+    _, _, H, W = image_shape
+    patches_per_side = int(np.sqrt(num_patches))
+    k = max(1, int(num_patches * topk_frac))
+    if mode == "top":
+        selected_indices = torch.topk(attention_scores, k=k, dim=-1).indices
+    elif mode == "bottom":
+        selected_indices = torch.topk(-attention_scores, k=k, dim=-1).indices
+    else:
+        raise ValueError(f"Unsupported mode: {mode}")
+
+    patch_mask = torch.zeros((B, 1, H, W), device=attention_scores.device)
+    for b in range(B):
+        for idx in selected_indices[b]:
+            patch_idx = idx.item()
+            row = patch_idx // patches_per_side
+            col = patch_idx % patches_per_side
+            h_start = row * patch_size
+            h_end = min(h_start + patch_size, H)
+            w_start = col * patch_size
+            w_end = min(w_start + patch_size, W)
+            patch_mask[b, :, h_start:h_end, w_start:w_end] = 1.0
+    return patch_mask
+
+
+def mask_topk_patches(images, attention_scores, patch_size, topk_frac):
+    keep_mask = 1.0 - build_patch_mask(attention_scores, patch_size, images.shape, topk_frac, mode="top")
+    return images * keep_mask
+
+
+def restore_topk_patches(images, attention_scores, patch_size, topk_frac, baseline_value=0.0):
+    base = torch.full_like(images, fill_value=baseline_value)
+    restore_mask = build_patch_mask(attention_scores, patch_size, images.shape, topk_frac, mode="top")
+    return base + images * restore_mask
+
+
+def compute_attention_faithfulness(model, loader, current_device, current_params, max_samples=64, topk_fracs=None):
+    if topk_fracs is None:
+        topk_fracs = [0.1, 0.2, 0.3]
+
+    model.eval()
+    deletion_stats = {f"top_{frac:.1f}": [] for frac in topk_fracs}
+    deletion_stats.update({f"random_{frac:.1f}": [] for frac in topk_fracs})
+    insertion_stats = {f"top_{frac:.1f}": [] for frac in topk_fracs}
+    insertion_stats.update({f"random_{frac:.1f}": [] for frac in topk_fracs})
+    processed = 0
+
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(current_device), y.to(current_device)
+            logits = model(x)
+            probs = torch.softmax(logits, dim=-1)
+            pred = logits.argmax(dim=-1)
+            base_conf = probs.gather(1, pred.unsqueeze(1)).squeeze(1)
+
+            attn_scores = extract_cls_attention_scores(
+                model,
+                x,
+                layer_aggregation="last",
+                head_aggregation=current_params["attention_head_aggregation"],
+            )
+            if attn_scores is None:
+                print("Skipping faithfulness computation because attention scores were not available.")
+                return None, None
+
+            for frac in topk_fracs:
+                masked_top = mask_topk_patches(x, attn_scores, current_params["patch_size"], frac)
+                masked_logits = model(masked_top)
+                masked_probs = torch.softmax(masked_logits, dim=-1)
+                masked_conf = masked_probs.gather(1, pred.unsqueeze(1)).squeeze(1)
+                deletion_stats[f"top_{frac:.1f}"].append((base_conf - masked_conf).mean().item())
+
+                restored_top = restore_topk_patches(x, attn_scores, current_params["patch_size"], frac)
+                restored_logits = model(restored_top)
+                restored_probs = torch.softmax(restored_logits, dim=-1)
+                restored_conf = restored_probs.gather(1, pred.unsqueeze(1)).squeeze(1)
+                insertion_stats[f"top_{frac:.1f}"].append(restored_conf.mean().item())
+
+                rand_scores = torch.rand_like(attn_scores)
+                masked_rand = mask_topk_patches(x, rand_scores, current_params["patch_size"], frac)
+                rand_logits = model(masked_rand)
+                rand_probs = torch.softmax(rand_logits, dim=-1)
+                rand_conf = rand_probs.gather(1, pred.unsqueeze(1)).squeeze(1)
+                deletion_stats[f"random_{frac:.1f}"].append((base_conf - rand_conf).mean().item())
+
+                restored_rand = restore_topk_patches(x, rand_scores, current_params["patch_size"], frac)
+                restored_rand_logits = model(restored_rand)
+                restored_rand_probs = torch.softmax(restored_rand_logits, dim=-1)
+                restored_rand_conf = restored_rand_probs.gather(1, pred.unsqueeze(1)).squeeze(1)
+                insertion_stats[f"random_{frac:.1f}"].append(restored_rand_conf.mean().item())
+
+            processed += x.size(0)
+            if processed >= max_samples:
+                break
+
+    deletion_summary = {k: float(np.mean(v)) if len(v) > 0 else np.nan for k, v in deletion_stats.items()}
+    insertion_summary = {k: float(np.mean(v)) if len(v) > 0 else np.nan for k, v in insertion_stats.items()}
+    return deletion_summary, insertion_summary
+
+
+def profile_model_efficiency(model, current_device, input_res=None, batch_sizes=(1, 8), num_warmup=3, num_iters=10):
+    results = []
+    if input_res is None:
+        input_res = (params["in_channels"], params["image_size"], params["image_size"])
+    model = model.to(current_device)
+
+    for batch_size in batch_sizes:
+        dummy_input = torch.randn((batch_size, *input_res), device=current_device)
+        dummy_target = torch.randint(0, params["num_classes"], (batch_size,), device=current_device)
+        criterion = torch.nn.CrossEntropyLoss()
+        optimizer = torch.optim.SGD(model.parameters(), lr=0.01)
+
+        model.eval()
+        for _ in range(num_warmup):
+            _ = model(dummy_input)
+        if current_device.type == "cuda":
+            torch.cuda.synchronize()
+
+        forward_times = []
+        if current_device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(current_device)
+        for _ in range(num_iters):
+            start = time.time()
+            _ = model(dummy_input)
+            if current_device.type == "cuda":
+                torch.cuda.synchronize()
+            forward_times.append(time.time() - start)
+
+        peak_mem_mb = None
+        if current_device.type == "cuda":
+            peak_mem_mb = torch.cuda.max_memory_allocated(current_device) / (1024 ** 2)
+
+        model.train()
+        backward_times = []
+        for _ in range(num_warmup):
+            optimizer.zero_grad()
+            output = model(dummy_input)
+            loss = criterion(output, dummy_target)
+            loss.backward()
+            optimizer.step()
+        if current_device.type == "cuda":
+            torch.cuda.synchronize()
+
+        for _ in range(num_iters):
+            optimizer.zero_grad()
+            start = time.time()
+            output = model(dummy_input)
+            loss = criterion(output, dummy_target)
+            loss.backward()
+            optimizer.step()
+            if current_device.type == "cuda":
+                torch.cuda.synchronize()
+            backward_times.append(time.time() - start)
+
+        try:
+            with torch.no_grad():
+                macs, n_params = get_model_complexity_info(
+                    model.cpu(),
+                    input_res,
+                    as_strings=False,
+                    print_per_layer_stat=False,
+                    verbose=False,
+                )
+            model = model.to(current_device)
+        except Exception:
+            macs, n_params = np.nan, sum(p.numel() for p in model.parameters())
+            model = model.to(current_device)
+
+        avg_forward = float(np.mean(forward_times))
+        avg_backward = float(np.mean(backward_times))
+        throughput = float(batch_size / avg_forward) if avg_forward > 0 else np.nan
+
+        results.append({
+            "batch_size": batch_size,
+            "forward_ms": 1000.0 * avg_forward,
+            "backward_ms": 1000.0 * avg_backward,
+            "throughput_img_s": throughput,
+            "peak_mem_mb": peak_mem_mb,
+            "macs": macs,
+            "params": n_params,
+        })
+
+    return results
+
+
+def train(model, loader, optimizer, criterion, use_svda, current_epoch, current_params):
+    model.train()
+    total_loss, total_correct = 0.0, 0
+    for x, y in loader:
+        x, y = x.to(device), y.to(device)
+        optimizer.zero_grad()
+        logits = model(x)
+        loss = criterion(logits, y)
+
+        if use_svda:
+            if current_epoch >= current_params["train_head_only_warmup_epochs"]:
+                loss = loss + model.orthogonality_loss()
+            sigma_blocks = [b.attn.sigmas for b in model.blocks if hasattr(b, "attn") and hasattr(b.attn, "sigmas")]
+            all_sigmas = torch.stack(sigma_blocks)
+            loss = loss + current_params["entropy_reg_weight"] * sigma_entropy_loss(all_sigmas)
+
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+        total_correct += (logits.argmax(1) == y).sum().item()
+
+    acc = total_correct / len(loader.dataset)
+    return total_loss / len(loader), acc
+
+
+def evaluate(model, loader):
+    model.eval()
+    correct = 0
+    with torch.no_grad():
+        for x, y in loader:
+            x, y = x.to(device), y.to(device)
+            logits = model(x)
+            correct += (logits.argmax(1) == y).sum().item()
+    return correct / len(loader.dataset)
+
+
+def build_model(use_svda_flag):
+    return PretrainedVisionTransformer(
+        use_svda=use_svda_flag,
+        num_classes=params["num_classes"],
+        lambda_ortho=params["lambda_ortho"],
+    )
+
+
+def run_experiment(use_svda_flag, current_seed=None):
+    if current_seed is None:
+        current_seed = params["seed"]
+
+    set_seed(current_seed)
+    current_params = {**params, "use_svda": use_svda_flag, "seed": current_seed}
+    local_train_loader, local_test_loader = build_dataloaders(current_params)
+    model_name = "svda" if use_svda_flag else "baseline"
+    run_dirs = get_run_dirs(current_params, model_name, current_seed)
+
+    print(f"\nTraining {'SVDA' if use_svda_flag else 'Baseline'} PRETRAINED {current_params['pretrained_backbone']} | seed={current_seed}...")
+    model = build_model(use_svda_flag).to(device)
+
+    set_trainable_layers(model, use_svda_flag, current_epoch=0, current_params=current_params)
+    optimizer = build_optimizer(model, current_params)
+    criterion = nn.CrossEntropyLoss()
+
+    train_accs, test_accs = [], []
+    entropy_log, rank_log, sparsity_log, time_log = [], [], [], []
+    selectivity_log, robustness_log, angular_log = [], [], []
+
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    print(f"Total parameters: {sum(p.numel() for p in model.parameters()):,} | Trainable parameters at start: {trainable_params:,}")
+
+    best_acc = -np.inf
+    best_state_dict = None
+
+    if use_svda_flag:
+        entropy_layerwise = []
+        rank_layerwise = []
+        sparsity_layerwise = []
+        alignment_layerwise = []
+        selectivity_layerwise = []
+        robustness_layerwise = []
+
+    for epoch in range(current_params["epochs"]):
+        start_time = time.time()
+        if use_svda_flag:
+            set_trainable_layers(model, use_svda_flag, current_epoch=epoch, current_params=current_params)
+            optimizer = build_optimizer(model, current_params)
+        train_loss, train_acc = train(
+            model,
+            local_train_loader,
+            optimizer,
+            criterion,
+            use_svda=use_svda_flag,
+            current_epoch=epoch,
+            current_params=current_params,
+        )
+        test_acc = evaluate(model, local_test_loader)
+        duration = time.time() - start_time
+        time_log.append(duration)
+
+        print(
+            f"Epoch {epoch+1:02d} | Train Acc: {train_acc:.4f} | "
+            f"Test Acc: {test_acc:.4f} | Time: {duration:.2f}s"
+        )
+
+        train_accs.append(train_acc)
+        test_accs.append(test_acc)
+
+        if test_acc > best_acc:
+            best_acc = test_acc
+            best_state_dict = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+
+        if use_svda_flag:
+            with torch.no_grad():
+                all_sigmas = [block.attn.sigmas.detach().cpu() for block in model.blocks if hasattr(block, "attn") and hasattr(block.attn, "sigmas")]
+                all_sigmas = torch.stack(all_sigmas)
+
+                ent = spectral_entropy(all_sigmas)
+                effr = effective_rank(ent)
+                spar = spectral_sparsity(all_sigmas)
+
+                entropy_log.append(ent.mean().item())
+                entropy_layerwise.append(ent.numpy())
+                rank_log.append(effr)
+                rank_layerwise.append(torch.exp(ent).numpy())
+                sparsity_log.append(spar)
+                sparsity_layerwise.append((all_sigmas.abs() < 1e-3).float().mean(dim=-1).numpy())
+
+                selectivity_per_layer = []
+                for block in model.blocks:
+                    if hasattr(block, "attn") and hasattr(block.attn, "attn_weights") and block.attn.attn_weights is not None:
+                        A = block.attn.attn_weights
+                        sel = 1 - (A ** 2).sum(dim=-1) / (A.sum(dim=-1) ** 2 + 1e-8)
+                        selectivity_per_layer.append(sel.mean(dim=(0, 1)).cpu().numpy())
+                    elif hasattr(block, "attn") and hasattr(block.attn, "sigmas"):
+                        selectivity_per_layer.append(np.nan * np.ones(current_params["num_heads"]))
+                selectivity_layerwise.append(np.stack(selectivity_per_layer))
+                selectivity_log.append(np.mean(selectivity_layerwise[-1]))
+
+                robustness_per_layer = []
+                sample_x, _ = next(iter(local_test_loader))
+                sample_x = sample_x[:1].to(device)
+                delta = torch.randn_like(sample_x) * 1e-2
+                perturbed_x = torch.clamp(sample_x + delta, -5, 5)
+                _ = model(sample_x)
+                A_clean_all = [block.attn.attn_weights for block in model.blocks if hasattr(block, "attn") and hasattr(block.attn, "attn_weights") and block.attn.attn_weights is not None]
+                _ = model(perturbed_x)
+                A_perturbed_all = [block.attn.attn_weights for block in model.blocks if hasattr(block, "attn") and hasattr(block.attn, "attn_weights") and block.attn.attn_weights is not None]
+                for A_clean, A_perturbed in zip(A_clean_all, A_perturbed_all):
+                    delta_A = (A_clean - A_perturbed).norm(p="fro") / A_clean.numel()
+                    robustness_per_layer.append(delta_A.item())
+                robustness_layerwise.append(robustness_per_layer)
+                robustness_log.append(np.mean(robustness_per_layer))
+
+                angular_vals = [b.attn.angular_alignments.mean().item() for b in model.blocks if hasattr(b, "attn") and hasattr(b.attn, "angular_alignments") and b.attn.angular_alignments is not None]
+                angular_log.append(np.mean(angular_vals))
+                alignment_layerwise.append(
+                    torch.stack([b.attn.angular_alignments for b in model.blocks if hasattr(b, "attn") and hasattr(b.attn, "angular_alignments") and b.attn.angular_alignments is not None]).cpu().numpy()
+                )
+
+    final_checkpoint = {
+        "model_state_dict": model.state_dict(),
+        "best_model_state_dict": best_state_dict,
+        "train_acc": train_accs,
+        "test_acc": test_accs,
+        "time_log": time_log,
+        "seed": current_seed,
+        "params": current_params,
+        "best_acc": best_acc,
+    }
+
+    if use_svda_flag:
+        final_checkpoint.update({
+            "entropy": entropy_log,
+            "effective_rank": rank_log,
+            "sparsity": sparsity_log,
+            "selectivity": selectivity_log,
+            "robustness": robustness_log,
+            "angular_alignment": angular_log,
+        })
+
+    checkpoint_path = os.path.join(run_dirs["checkpoints"], f"{model_name}_results_seed{current_seed}.pth")
+    torch.save(final_checkpoint, checkpoint_path)
+
+    np.save(os.path.join(run_dirs["metrics"], f"test_accuracy_seed{current_seed}.npy"), np.array(test_accs))
+    np.save(os.path.join(run_dirs["metrics"], f"epoch_time_seed{current_seed}.npy"), np.array(time_log))
+
+    if use_svda_flag:
+        np.save(os.path.join(run_dirs["metrics"], f"entropy_seed{current_seed}.npy"), np.array(entropy_log))
+        np.save(os.path.join(run_dirs["metrics"], f"effective_rank_seed{current_seed}.npy"), np.array(rank_log))
+        np.save(os.path.join(run_dirs["metrics"], f"sparsity_seed{current_seed}.npy"), np.array(sparsity_log))
+        np.save(os.path.join(run_dirs["metrics"], f"selectivity_seed{current_seed}.npy"), np.array(selectivity_log))
+        np.save(os.path.join(run_dirs["metrics"], f"robustness_seed{current_seed}.npy"), np.array(robustness_log))
+        np.save(os.path.join(run_dirs["metrics"], f"angular_alignment_seed{current_seed}.npy"), np.array(angular_log))
+        np.save(os.path.join(run_dirs["metrics"], f"entropy_layerwise_seed{current_seed}.npy"), np.array(entropy_layerwise))
+        np.save(os.path.join(run_dirs["metrics"], f"rank_layerwise_seed{current_seed}.npy"), np.array(rank_layerwise))
+        np.save(os.path.join(run_dirs["metrics"], f"sparsity_layerwise_seed{current_seed}.npy"), np.array(sparsity_layerwise))
+        np.save(os.path.join(run_dirs["metrics"], f"angular_alignment_layerwise_seed{current_seed}.npy"), np.array(alignment_layerwise))
+        np.save(os.path.join(run_dirs["metrics"], f"selectivity_layerwise_seed{current_seed}.npy"), np.array(selectivity_layerwise))
+        np.save(os.path.join(run_dirs["metrics"], f"robustness_layerwise_seed{current_seed}.npy"), np.array(robustness_layerwise))
+
+    attention_summary = summarize_attention_metrics(model, current_params, local_test_loader, device)
+    deletion_summary, insertion_summary = compute_attention_faithfulness(
+        model,
+        local_test_loader,
+        device,
+        current_params,
+        max_samples=current_params["faithfulness_eval_samples"],
+        topk_fracs=current_params["faithfulness_topk_fracs"],
+    )
+    efficiency_summary = profile_model_efficiency(
+        model,
+        device,
+        input_res=(current_params["in_channels"], current_params["image_size"], current_params["image_size"]),
+        batch_sizes=tuple(current_params["profile_batch_sizes"]),
+    ) if current_params["compute_efficiency"] else None
+
+    run_summary = {
+        "run_name": get_run_name(model_name, current_seed),
+        "model": model_name,
+        "seed": current_seed,
+        "best_acc": best_acc,
+        "final_acc": test_accs[-1],
+        "mean_epoch_time": float(np.mean(time_log)),
+        "attention_summary": attention_summary,
+        "deletion_summary": deletion_summary,
+        "insertion_summary": insertion_summary,
+        "efficiency_summary": efficiency_summary,
+        "checkpoint_path": checkpoint_path,
+    }
+
+    with open(os.path.join(run_dirs["root"], "run_summary.json"), "w") as f:
+        json.dump(run_summary, f, indent=2)
+
+    return {
+        "model": model,
+        "train_acc": train_accs,
+        "test_acc": test_accs,
+        "time_log": time_log,
+        "entropy": entropy_log if use_svda_flag else None,
+        "effective_rank": rank_log if use_svda_flag else None,
+        "sparsity": sparsity_log if use_svda_flag else None,
+        "selectivity": selectivity_log if use_svda_flag else None,
+        "robustness": robustness_log if use_svda_flag else None,
+        "angular_alignment": angular_log if use_svda_flag else None,
+        "summary": run_summary,
+    }
+
+
+def build_faithfulness_table(all_summaries):
+    rows = []
+    for item in all_summaries:
+        deletion_summary = item.get("deletion_summary") or {}
+        insertion_summary = item.get("insertion_summary") or {}
+        for frac in params["faithfulness_topk_fracs"]:
+            frac_key = f"{frac:.1f}"
+            rows.append({
+                "model": item["model"],
+                "seed": item["seed"],
+                "topk_frac": frac,
+                "deletion_top": deletion_summary.get(f"top_{frac_key}", np.nan),
+                "deletion_random": deletion_summary.get(f"random_{frac_key}", np.nan),
+                "insertion_top": insertion_summary.get(f"top_{frac_key}", np.nan),
+                "insertion_random": insertion_summary.get(f"random_{frac_key}", np.nan),
+            })
+    return pd.DataFrame(rows)
+
+
+def save_faithfulness_outputs(all_summaries):
+    faithfulness_df = build_faithfulness_table(all_summaries)
+    faithfulness_csv = os.path.join(params["log_root"], "faithfulness_comparison.csv")
+    faithfulness_df.to_csv(faithfulness_csv, index=False)
+
+    mean_df = faithfulness_df.groupby(["model", "topk_frac"])[[
+        "deletion_top", "deletion_random", "insertion_top", "insertion_random"
+    ]].mean().reset_index()
+    std_df = faithfulness_df.groupby(["model", "topk_frac"])[[
+        "deletion_top", "deletion_random", "insertion_top", "insertion_random"
+    ]].std().reset_index()
+    mean_df = mean_df.rename(columns={c: f"{c}_mean" for c in ["deletion_top", "deletion_random", "insertion_top", "insertion_random"]})
+    std_df = std_df.rename(columns={c: f"{c}_std" for c in ["deletion_top", "deletion_random", "insertion_top", "insertion_random"]})
+    merged = mean_df.merge(std_df, on=["model", "topk_frac"], how="left")
+    merged.to_csv(os.path.join(params["log_root"], "faithfulness_comparison_mean_std.csv"), index=False)
+    return faithfulness_df, merged
+
+
+def save_experiment_summary(all_run_summaries):
+    summary_rows = []
+    for item in all_run_summaries:
+        row = {
+            "run_name": item["run_name"],
+            "model": item["model"],
+            "seed": item["seed"],
+            "best_acc": item["best_acc"],
+            "final_acc": item["final_acc"],
+            "mean_epoch_time": item["mean_epoch_time"],
+        }
+        attention_summary = item.get("attention_summary") or {}
+        deletion_summary = item.get("deletion_summary") or {}
+        insertion_summary = item.get("insertion_summary") or {}
+        efficiency_summary = item.get("efficiency_summary") or []
+
+        for key, value in attention_summary.items():
+            row[f"attn_{key}"] = value
+        for key, value in deletion_summary.items():
+            row[f"deletion_{key}"] = value
+        for key, value in insertion_summary.items():
+            row[f"insertion_{key}"] = value
+        for eff in efficiency_summary:
+            batch_size = eff.get("batch_size")
+            if batch_size is None:
+                continue
+            row[f"forward_ms_bs{batch_size}"] = eff.get("forward_ms", np.nan)
+            row[f"backward_ms_bs{batch_size}"] = eff.get("backward_ms", np.nan)
+            row[f"throughput_img_s_bs{batch_size}"] = eff.get("throughput_img_s", np.nan)
+            row[f"peak_mem_mb_bs{batch_size}"] = eff.get("peak_mem_mb", np.nan)
+            row[f"macs_bs{batch_size}"] = eff.get("macs", np.nan)
+            row[f"params_bs{batch_size}"] = eff.get("params", np.nan)
+        summary_rows.append(row)
+
+    experiment_summary_df = pd.DataFrame(summary_rows)
+    experiment_summary_df.to_csv(os.path.join(params["log_root"], "experiment_summary.csv"), index=False)
+
+    numeric_cols = [col for col in experiment_summary_df.columns if col not in {"run_name", "model", "seed"}]
+    mean_df = experiment_summary_df.groupby("model")[numeric_cols].mean().add_suffix("_mean")
+    std_df = experiment_summary_df.groupby("model")[numeric_cols].std().add_suffix("_std")
+    summary_mean_std = pd.concat([mean_df, std_df], axis=1).reset_index()
+    summary_mean_std.to_csv(os.path.join(params["log_root"], "experiment_summary_mean_std.csv"), index=False)
+    return experiment_summary_df, summary_mean_std
+
+
+def run_training_pipeline():
+    all_run_summaries = []
+    last_baseline_results = None
+    last_svda_results = None
+
+    for seed in params["seeds"]:
+        baseline_results = run_experiment(use_svda_flag=False, current_seed=seed)
+        svda_results = run_experiment(use_svda_flag=True, current_seed=seed)
+        all_run_summaries.append(baseline_results["summary"])
+        all_run_summaries.append(svda_results["summary"])
+        last_baseline_results = baseline_results
+        last_svda_results = svda_results
+
+    os.makedirs(params["log_root"], exist_ok=True)
+    with open(os.path.join(params["log_root"], "all_run_summaries.json"), "w") as f:
+        json.dump(all_run_summaries, f, indent=2)
+
+    return {
+        "all_run_summaries": all_run_summaries,
+        "last_baseline_results": last_baseline_results,
+        "last_svda_results": last_svda_results,
+    }
+
+
+def generate_reports(training_outputs):
+    all_run_summaries = training_outputs["all_run_summaries"]
+    save_faithfulness_outputs(all_run_summaries)
+    save_experiment_summary(all_run_summaries)
+
+
+if __name__ == "__main__":
+    training_outputs = None
+    if params["run_training"]:
+        training_outputs = run_training_pipeline()
+    else:
+        raise RuntimeError(
+            "run_training=False is not yet supported in this pretrained pilot script."
+        )
+
+    if params["run_reporting"]:
+        generate_reports(training_outputs)
